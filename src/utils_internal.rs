@@ -1,8 +1,16 @@
+#![allow(clippy::mut_range_bound)]
+
+#[cfg(feature = "bluetooth-le")]
+use crate::connections::ble_handler::{Ble, BleHandler};
 use crate::errors_internal::Error;
+#[cfg(feature = "bluetooth-le")]
+use futures::stream::StreamExt;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use rand::{distributions::Standard, prelude::Distribution, Rng};
+#[cfg(feature = "bluetooth-le")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_serial::{available_ports, SerialPort, SerialStream};
 
 use crate::connections::stream_api::StreamHandle;
@@ -192,6 +200,84 @@ pub async fn build_tcp_stream(
     };
 
     Ok(StreamHandle::from_stream(stream))
+}
+
+#[cfg(feature = "bluetooth-le")]
+pub async fn build_ble_stream(name: String) -> Result<StreamHandle<DuplexStream>, Error> {
+    let ble_handler = BleHandler::new(name).await?;
+    build_ble_stream_impl(ble_handler).await
+}
+
+#[cfg(feature = "bluetooth-le")]
+pub async fn build_ble_stream_impl<B: Ble + Send + 'static>(
+    ble_handler: B,
+) -> Result<StreamHandle<DuplexStream>, Error> {
+    use crate::{connections::ble_handler::AdapterEvent, errors_internal::InternalStreamError};
+    // `client` will be returned to the user, server is the opposite end of the channel and it's
+    // directly connected to a `BleHandler`.
+    let (client, mut server) = tokio::io::duplex(1024);
+    let handle = tokio::spawn(async move {
+        let duplex_write_error_fn = |e| {
+            Error::InternalStreamError(InternalStreamError::StreamWriteError {
+                source: Box::new(e),
+            })
+        };
+        let mut read_messages_count = ble_handler.read_fromnum().await?;
+        let mut buf = [0u8; 1024];
+        if let Ok(len) = server.read(&mut buf).await {
+            ble_handler.write_to_radio(&buf[..len]).await?
+        }
+        while let Ok(msg) = ble_handler.read_from_radio().await {
+            if msg.is_empty() {
+                break;
+            }
+            let msg = format_data_packet(msg.into())?;
+            server
+                .write(msg.data())
+                .await
+                .map_err(duplex_write_error_fn)?;
+        }
+
+        let mut notification_stream = ble_handler.notifications().await?;
+        let mut adapter_events = ble_handler.adapter_events().await?;
+        loop {
+            // Note: the following `tokio::select` is only half-duplex on the BLE radio. While we
+            // are reading from the radio, we are not writing to it and vice versa. However, BLE is
+            // a half-duplex technology, so we wouldn't gain much with a full duplex solution
+            // anyway.
+            tokio::select!(
+                // Data from device, forward it to the user
+                notification = notification_stream.next() => {
+                    if let Some(avail_msg_count) = notification {
+                        for _ in read_messages_count..avail_msg_count {
+                            let radio_msg = ble_handler.read_from_radio().await?;
+                            let msg = format_data_packet(radio_msg.into())?;
+                            server.write(msg.data()).await.map_err(duplex_write_error_fn)?;
+                            read_messages_count += 1;
+                        }
+                    } else {
+                        // TODO: failed to parse notification. Should we log it? Return error to user?
+                    }
+                },
+                // Data from user, forward it to the device
+                from_server = server.read(&mut buf) => {
+                    let len = from_server.map_err(duplex_write_error_fn)?;
+                    ble_handler.write_to_radio(&buf[..len]).await?;
+                },
+                event = adapter_events.next() => {
+                    if Some(AdapterEvent::Disconnected) == event {
+                        println!("Disconnected");
+                        return Err(Error::InternalStreamError(InternalStreamError::ConnectionLost))
+                    }
+                }
+            );
+        }
+    });
+
+    Ok(StreamHandle {
+        stream: client,
+        join_handle: Some(handle),
+    })
 }
 
 /// A helper method to generate random numbers using the `rand` crate.

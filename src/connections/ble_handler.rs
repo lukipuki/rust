@@ -3,8 +3,10 @@ use btleplug::api::{
     ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
+use futures::stream::StreamExt;
 use futures_util::stream::BoxStream;
 use log::error;
+use std::future;
 use uuid::Uuid;
 
 use crate::errors_internal::{BleConnectionError, Error, InternalStreamError};
@@ -20,6 +22,26 @@ pub struct BleHandler {
     toradio_char: Characteristic,
     fromradio_char: Characteristic,
     fromnum_char: Characteristic,
+}
+
+#[derive(PartialEq)]
+pub enum AdapterEvent {
+    Disconnected,
+}
+
+pub trait Ble {
+    fn write_to_radio(
+        &self,
+        buffer: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
+    fn read_from_radio(&self) -> impl std::future::Future<Output = Result<Vec<u8>, Error>> + Send;
+    fn read_fromnum(&self) -> impl std::future::Future<Output = Result<u32, Error>> + Send;
+    fn notifications(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BoxStream<u32>, Error>> + Send;
+    fn adapter_events(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BoxStream<AdapterEvent>, Error>> + Send;
 }
 
 #[allow(dead_code)]
@@ -64,7 +86,7 @@ impl BleHandler {
         let adapters = manager.adapters().await.map_err(scan_error_fn)?;
 
         for adapter in &adapters {
-            let peripherals = Self::scan_peripherals(&adapter).await;
+            let peripherals = Self::scan_peripherals(adapter).await;
             match peripherals {
                 Err(e) => {
                     error!("Error while scanning for meshtastic peripherals: {e:?}");
@@ -119,7 +141,23 @@ impl BleHandler {
         ])
     }
 
-    pub async fn write_to_radio(&self, buffer: &[u8]) -> Result<(), Error> {
+    fn ble_read_error_fn(e: btleplug::Error) -> Error {
+        Error::InternalStreamError(InternalStreamError::StreamReadError {
+            source: Box::new(e),
+        })
+    }
+    fn parse_u32(data: Vec<u8>) -> Result<u32, Error> {
+        let data = data.as_slice().try_into().map_err(|e| {
+            Error::InternalStreamError(InternalStreamError::StreamReadError {
+                source: Box::new(e),
+            })
+        })?;
+        Ok(u32::from_le_bytes(data))
+    }
+}
+
+impl Ble for BleHandler {
+    async fn write_to_radio(&self, buffer: &[u8]) -> Result<(), Error> {
         self.radio
             // TODO: remove the skipping of the first 4 bytes
             .write(&self.toradio_char, &buffer[4..], WriteType::WithResponse)
@@ -131,29 +169,14 @@ impl BleHandler {
             })
     }
 
-    fn ble_read_error_fn(e: btleplug::Error) -> Error {
-        Error::InternalStreamError(InternalStreamError::StreamReadError {
-            source: Box::new(e),
-        })
-    }
-
-    pub async fn read_from_radio(&self) -> Result<Vec<u8>, Error> {
+    async fn read_from_radio(&self) -> Result<Vec<u8>, Error> {
         self.radio
             .read(&self.fromradio_char)
             .await
             .map_err(Self::ble_read_error_fn)
     }
 
-    fn parse_u32(data: Vec<u8>) -> Result<u32, Error> {
-        let parsed_value = u32::from_le_bytes(data.as_slice().try_into().map_err(|e| {
-            Error::InternalStreamError(InternalStreamError::StreamReadError {
-                source: Box::new(e),
-            })
-        })?);
-        Ok(parsed_value)
-    }
-
-    pub async fn read_fromnum(&self) -> Result<u32, Error> {
+    async fn read_fromnum(&self) -> Result<u32, Error> {
         let data = self
             .radio
             .read(&self.fromnum_char)
@@ -162,41 +185,45 @@ impl BleHandler {
         Self::parse_u32(data)
     }
 
-    pub async fn notifications(&self) -> Result<BoxStream<ValueNotification>, Error> {
+    async fn notifications(&self) -> Result<BoxStream<u32>, Error> {
         self.radio
             .subscribe(&self.fromnum_char)
             .await
             .map_err(Self::ble_read_error_fn)?;
-        self.radio
+        let notification_stream = self
+            .radio
             .notifications()
             .await
-            .map_err(Self::ble_read_error_fn)
+            .map_err(Self::ble_read_error_fn)?;
+
+        Ok(Box::pin(notification_stream.filter_map(
+            |notification| match notification {
+                ValueNotification {
+                    uuid: FROMNUM,
+                    value,
+                } => future::ready(Self::parse_u32(value).ok()),
+                _ => future::ready(None),
+            },
+        )))
     }
 
-    pub async fn filter_map(notification: ValueNotification) -> Option<u32> {
-        match notification {
-            ValueNotification {
-                uuid: FROMNUM,
-                value,
-            } => Some(Self::parse_u32(value).unwrap()),
-            _ => None,
-        }
-    }
-
-    pub async fn adapter_events(&self) -> Result<BoxStream<CentralEvent>, Error> {
-        self.adapter
+    async fn adapter_events(&self) -> Result<BoxStream<AdapterEvent>, Error> {
+        let stream = self
+            .adapter
             .events()
             .await
             .map_err(|e| Error::StreamBuildError {
                 source: Box::new(e),
-                description: format!("Failed to listen to device events"),
-            })
-    }
-
-    pub fn is_disconnected_event(&self, event: Option<CentralEvent>) -> bool {
-        if let Some(CentralEvent::DeviceDisconnected(peripheral_id)) = event {
-            return self.radio.id() == peripheral_id;
-        }
-        return false;
+                description: "Failed to listen to device events".to_owned(),
+            })?;
+        let id = self.radio.id();
+        Ok(Box::pin(stream.filter_map(move |event| {
+            if let CentralEvent::DeviceDisconnected(peripheral_id) = event {
+                if id == peripheral_id {
+                    return future::ready(Some(AdapterEvent::Disconnected));
+                }
+            }
+            future::ready(None)
+        })))
     }
 }
