@@ -127,7 +127,9 @@ pub mod utils {
     /// only need to use these two methods to connect to a radio. The `available_serial_ports` method
     /// can also be used to list all available serial ports on the host machine.
     pub mod stream {
+        #[cfg(feature = "serial")]
         pub use crate::utils_internal::available_serial_ports;
+        #[cfg(feature = "serial")]
         pub use crate::utils_internal::build_serial_stream;
         pub use crate::utils_internal::build_tcp_stream;
     }

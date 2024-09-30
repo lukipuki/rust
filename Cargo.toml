@@ -15,14 +15,16 @@ edition = "2021"
 doctest = false
 
 [features]
-default = ["serde"]
+default = ["serde", "serial"]
 
+serial = ["dep:tokio-serial"]
 serde = ["dep:serde", "dep:serde_json"]
 ts-gen = ["serde", "dep:specta"]
 bluetooth-le = ["dep:uuid","dep:btleplug"]
 
 [[example]]
 name = "basic_serial"
+required-features = ["serial"]
 
 [[example]]
 name = "basic_tcp"
@@ -44,7 +46,7 @@ walkdir = "2.3.2"
 futures-util = "0.3.28"
 rand = "0.8.5"
 tokio = { version = "1.32.0", features = ["full"] }
-tokio-serial = "5.4.4"
+tokio-serial = { version = "5.4.4", optional = true }
 tokio-util = "0.7.8"
 prost = "0.11.0"
 log = "0.4.20"

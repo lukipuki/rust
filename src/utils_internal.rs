@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 use rand::{distributions::Standard, prelude::Distribution, Rng};
+#[cfg(feature = "serial")]
 use tokio_serial::{available_ports, SerialPort, SerialStream};
 
 use crate::connections::stream_api::StreamHandle;
@@ -60,6 +61,7 @@ pub const DEFAULT_RTS_PIN_STATE: bool = false;
 ///
 /// None
 ///
+#[cfg(feature = "serial")]
 pub fn available_serial_ports() -> Result<Vec<String>, tokio_serial::Error> {
     let ports = available_ports()?
         .into_iter()
@@ -112,6 +114,7 @@ pub fn available_serial_ports() -> Result<Vec<String>, tokio_serial::Error> {
 ///
 /// None
 ///
+#[cfg(feature = "serial")]
 pub fn build_serial_stream(
     port_name: String,
     baud_rate: Option<u32>,
